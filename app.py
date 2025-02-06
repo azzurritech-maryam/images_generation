@@ -1,114 +1,175 @@
 import json
 import requests
 import time
-import os
 from dotenv import load_dotenv
+import os
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
+app = FastAPI()
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Change "*" to frontend domain if needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Load API key from .env file
 load_dotenv()
 api_key = os.getenv("API_KEY")
-if not api_key:
-    raise ValueError("API key not found in .env file.")
-
-authorization = f"Bearer {api_key}"
+authorization = "Bearer %s" % api_key
 
 headers = {
     "accept": "application/json",
     "content-type": "application/json",
-    "authorization": authorization
+    "authorization": authorization,
 }
 
-def get_presigned_url():
-    """Get a presigned URL for uploading an image."""
-    init_image_url = "https://cloud.leonardo.ai/api/rest/v1/init-image"
-    payload = {"extension": "jpg"}
-    response = requests.post(init_image_url, json=payload, headers=headers)
-    response.raise_for_status()
-    upload_data = response.json()["uploadInitImage"]
-    return upload_data["url"], json.loads(upload_data["fields"]), upload_data["id"]
 
-def upload_image(upload_url, fields, image_file_path):
-    """Upload the image to the presigned URL."""
-    with open(image_file_path, "rb") as image_file:
-        files = {"file": image_file}
-        response = requests.post(upload_url, data=fields, files=files)
-        response.raise_for_status()
-    return True
+@app.post("/generate-image/")
+async def generate_image(
+    image: UploadFile, prompt: str = Form(...), num_images: int = Form(...)
+):
+    # Step 1: Get a presigned URL for uploading an image
+    url = "https://cloud.leonardo.ai/api/rest/v1/init-image"
+    payload = {"extension": image.filename.split(".")[-1]}
 
-def generate_image(prompt, image_id):
-    """Generate an image using the uploaded image ID and prompt."""
-    generation_url = "https://cloud.leonardo.ai/api/rest/v1/generations"
+    response = requests.post(url, json=payload, headers=headers)
+    response_data = response.json()
+    print("Init Image Response:", response_data)  # Debugging print
+
+    fields = response_data.get("uploadInitImage", {}).get("fields", {})
+    upload_url = response_data.get("uploadInitImage", {}).get("url", "")
+    uploaded_image_id = response_data.get("uploadInitImage", {}).get("id", "")
+
+    if not fields or not upload_url or not uploaded_image_id:
+        return JSONResponse(
+            content={"error": "Invalid response structure for init image upload"},
+            status_code=500,
+        )
+
+    # Convert fields to dictionary if it is not already
+    if isinstance(fields, str):
+        fields = json.loads(fields)
+
+    # Step 2: Upload the image via the presigned URL
+    files = {"file": await image.read()}
+    upload_response = requests.post(upload_url, data=fields, files=files)
+    print(
+        "Upload Response:", upload_response.status_code, upload_response.content
+    )  # Debugging print
+
+    # Step 3: Generate an image
+    url = "https://cloud.leonardo.ai/api/rest/v1/generations"
     payload = {
-        "height": 512,
-        "modelId": "6bef9f1b-29cb-40c7-b9df-32b51c1f67d3",  # Leonardo Creative model
+        "height": 896,
+        "modelId": "1e60896f-3c26-4296-8ecc-53e2afecc132",  # Leonardo Kino XL
         "prompt": prompt,
-        "width": 512,
-        "imagePrompts": [image_id],  # Pass the uploaded image ID
-        "num_images": 1  # Limit to one output image
+        "width": 896,
+        "imagePrompts": [uploaded_image_id],
+        "num_images": 1,
+        "init_strength": 0.5,
+        "alchemy": True,
     }
-    print("Generation Payload:", json.dumps(payload, indent=2))  # Debug payload
-    response = requests.post(generation_url, json=payload, headers=headers)
-    print("Generation Response:", response.text)  # Debug response
-    response.raise_for_status()
-    return response.json()["sdGenerationJob"]["generationId"]
 
-def get_generation_result(generation_id):
-    """Retrieve the generation result."""
-    generation_status_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
-    time.sleep(20)  # Wait for generation to complete
-    response = requests.get(generation_status_url, headers=headers)
-    print("Generation Result Response:", response.text)  # Debug result response
-    response.raise_for_status()
+    response = requests.post(url, json=payload, headers=headers)
+    response_data = response.json()
+    print("Generation Response 1:", response_data)  # Debugging print
 
-    result = response.json()
-    
-    # Access nested "generated_images" key
-    generated_images = result.get("generations_by_pk", {}).get("generated_images", [])
-    if not generated_images:
-        print("No images were generated. Please verify input parameters.")
-        raise ValueError("No images generated.")
+    generation_id = response_data.get("sdGenerationJob", {}).get("generationId", "")
 
-    return generated_images[0]["url"]  # Return the URL of the first image
+    if not generation_id:
+        return JSONResponse(
+            content={"error": "Invalid response structure for image generation"},
+            status_code=500,
+        )
 
-def save_image(image_url, output_path):
-    """Save the generated image to the specified path."""
-    response = requests.get(image_url, stream=True)
-    response.raise_for_status()
-    with open(output_path, "wb") as file:
-        for chunk in response.iter_content(chunk_size=8192):
-            file.write(chunk)
+    # Step 4: Get the generated image
+    url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
+    time.sleep(30)  # Wait for the image to be generated
+    response = requests.get(url, headers=headers)
+    response_data = response.json()
+    print("Get Images Response 1:", response_data)  # Debugging print
 
-def main():
-    # Inputs
-    image_file_path = input("Enter the path to the input image: ")
-    if not os.path.exists(image_file_path):
-        print("Input image file does not exist. Exiting.")
-        return
+    generated_image_id = (
+        response_data.get("generations_by_pk", {})
+        .get("generated_images", [{}])[0]
+        .get("id", "")
+    )
 
-    prompt = input("Enter the prompt for the new image: ")
-    output_path = "./generated_image.png"
+    if not generated_image_id:
+        return JSONResponse(
+            content={"error": "No images generated in the first request"},
+            status_code=500,
+        )
 
-    # Get presigned URL and upload image
-    print("Getting presigned URL...")
-    upload_url, fields, image_id = get_presigned_url()
-    print(f"Uploading image with ID: {image_id}...")
-    upload_image(upload_url, fields, image_file_path)
+    # Step 5: Combine both uploaded and generated images
+    url = "https://cloud.leonardo.ai/api/rest/v1/generations"
+    payload = {
+        "height": 896,
+        "presetStyle": "DYNAMIC",
+        "modelId": "aa77f04e-3eec-4034-9c07-d0f619684628",  # Leonardo Kino XL
+        "prompt": "Replace the hairstyle of a character in the reference image with a new hairstyle, ensuring perfect alignment with the character's head shape and facial features. Preserve the original lighting, shadows, and background for a realistic look. Blend the new hairstyle seamlessly, ensuring consistent textures, colors, and proportions for a natural integration without altering the character's facial expressions or outfit",
+        "width": 896,
+        "num_images": num_images,  # Updated to allow multiple images
+        "alchemy": True,
+        "controlnets": [
+            {
+                "initImageId": uploaded_image_id,
+                "initImageType": "UPLOADED",
+                "preprocessorId": 133,  # Character Reference Id
+                "strengthType": "Mid",
+            },
+            {
+                "initImageId": generated_image_id,
+                "initImageType": "GENERATED",
+                "preprocessorId": 67,  # Style Reference Id
+                "strengthType": "High",
+            },
+        ],
+    }
 
-    # Generate the image
-    print("Generating image...")
-    generation_id = generate_image(prompt, image_id)
+    response = requests.post(url, json=payload, headers=headers)
+    response_data = response.json()
+    print("Generation Response 2:", response_data)  # Debugging print
 
-    # Get the result and save the image
-    print("Fetching generated image...")
-    try:
-        image_url = get_generation_result(generation_id)
-        print(f"Generated image URL: {image_url}")
+    final_generation_id = response_data.get("sdGenerationJob", {}).get(
+        "generationId", ""
+    )
 
-        print("Saving the generated image...")
-        save_image(image_url, output_path)
-        print(f"Generated image saved at: {output_path}")
-    except ValueError as e:
-        print(str(e))
+    if not final_generation_id:
+        return JSONResponse(
+            content={"error": "Invalid response structure for final image generation"},
+            status_code=500,
+        )
 
+    # Step 6: Get the final combined images
+    url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{final_generation_id}"
+    time.sleep(60)  # Wait for the images to be generated
+    response = requests.get(url, headers=headers)
+    response_data = response.json()
+    print("Get Images Response 2:", response_data)  # Debugging print
+
+    # Extract URLs of the combined images
+    combined_image_urls = [
+        image.get("url", "")
+        for image in response_data.get("generations_by_pk", {}).get(
+            "generated_images", []
+        )
+    ]
+
+    if not combined_image_urls:
+        return JSONResponse(
+            content={"error": "No combined images generated"}, status_code=500
+        )
+
+    return JSONResponse(content={"combined_image_urls": combined_image_urls})
+
+
+# Run FastAPI
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8001)
